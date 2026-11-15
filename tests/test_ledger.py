@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from pull_shark import Ledger
 
 
@@ -39,4 +41,45 @@ def test_save_is_atomic_and_leaves_no_tmp_file(tmp_path):
     led = Ledger.load(path)
     led.save()
     assert json.loads(path.read_text())["seq"] == 0
-    assert not (tmp_path / "ledger.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_partial_ledger_is_quarantined_and_reset(tmp_path, capsys):
+    path = tmp_path / "ledger.json"
+    path.write_text('{"seq": 42}')
+    led = Ledger.load(path)
+    assert (led.seq, led.merged) == (0, 0)
+    assert list(tmp_path.glob("ledger.json.corrupt-*"))
+    assert "corrupt ledger" in capsys.readouterr().err
+
+
+def test_save_failure_leaves_previous_ledger_intact(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.json"
+    led = Ledger.load(path)
+    led.next_seq()
+    led.merged = 1
+    led.save()
+    before = path.read_text()
+
+    led.seq = 99
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("pull_shark.json.dumps", boom)
+    with pytest.raises(OSError):
+        led.save()
+    assert path.read_text() == before
+
+
+def test_save_creates_nested_parent_dirs(tmp_path):
+    path = tmp_path / "a" / "b" / "ledger.json"
+    led = Ledger.load(path)
+    led.save()
+    assert path.exists()
+
+
+def test_direct_construction_normalises_path(tmp_path):
+    led = Ledger(path=str(tmp_path / "ledger.json"))
+    led.save()
+    assert (tmp_path / "ledger.json").exists()

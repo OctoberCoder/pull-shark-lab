@@ -33,24 +33,44 @@ USER_AGENT = "pull-shark-lab"
 
 @dataclass
 class Ledger:
-    """Durable progress state, written atomically after every cycle."""
+    """Durable progress state. Mutating methods do not persist; call save()."""
 
     path: Path
     seq: int = 0
     merged: int = 0
     updated_at: str = ""
 
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+
     @classmethod
     def load(cls, path: Path) -> "Ledger":
-        led = cls(path=Path(path))
+        src = Path(path)
         try:
-            data = json.loads(led.path.read_text())
-            led.seq = int(data["seq"])
-            led.merged = int(data["merged"])
-            led.updated_at = str(data.get("updated_at", ""))
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError):
-            pass
-        return led
+            data = json.loads(src.read_text())
+        except FileNotFoundError:
+            return cls(path=src)
+        except (json.JSONDecodeError, ValueError):
+            cls._quarantine(src)
+            return cls(path=src)
+        try:
+            seq = int(data["seq"])
+            merged = int(data["merged"])
+            updated_at = str(data.get("updated_at", ""))
+        except (KeyError, TypeError, ValueError):
+            cls._quarantine(src)
+            return cls(path=src)
+        return cls(path=src, seq=seq, merged=merged, updated_at=updated_at)
+
+    @staticmethod
+    def _quarantine(path: Path) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = path.with_name(f"{path.name}.corrupt-{stamp}")
+        try:
+            path.replace(target)
+        except OSError:
+            return
+        print(f"warning: corrupt ledger moved to {target}; starting from zero", file=sys.stderr)
 
     def next_seq(self) -> int:
         self.seq += 1
@@ -60,6 +80,9 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         payload = {"seq": self.seq, "merged": self.merged, "updated_at": self.updated_at}
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2))
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "w") as fh:
+            fh.write(json.dumps(payload, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(self.path)
