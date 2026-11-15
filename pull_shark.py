@@ -131,20 +131,47 @@ class Pacer:
 
 
 class GitHubError(RuntimeError):
-    """An HTTP error from the GitHub API, with status and retry hint preserved."""
+    """An HTTP error from the GitHub API, with status and retry hints preserved."""
 
-    def __init__(self, status: int, message: str, retry_after: float | None = None) -> None:
-        super().__init__(f"HTTP {status}: {message}")
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        retry_after: float | None = None,
+        method: str = "",
+        path: str = "",
+        retryable: bool = False,
+    ) -> None:
+        where = f" {method} {path}".rstrip()
+        super().__init__(f"HTTP {status}{where}: {message}")
         self.status = status
         self.message = message
         self.retry_after = retry_after
+        self.method = method
+        self.path = path
+        self.retryable = retryable
 
 
 RETRYABLE = frozenset({403, 429, 500, 502, 503, 504})
+TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError)
+MAX_RETRY_AFTER = 300.0
+
+
+def is_retryable(status: int, detail: str, retry_after: float | None) -> bool:
+    """403 is ambiguous: retry only when GitHub signals a rate limit."""
+    if status == 403:
+        return retry_after is not None or "rate limit" in detail.lower()
+    return status in RETRYABLE
 
 
 class GitHubAPI:
-    """Thin REST wrapper. Every call goes through request() for uniform retry."""
+    """Thin REST wrapper. Every call goes through request() for uniform retry.
+
+    Retrying a non-idempotent write can surface as a duplicate (422 from
+    POST /pulls, 409 from PUT /contents after the sha moved). That is
+    detectable rather than silent: the Runner records only merged PRs, so
+    a duplicate write fails one cycle and burns nothing further.
+    """
 
     def __init__(self, token: str, repo: str, sleeper=time.sleep) -> None:
         self.token = token
@@ -154,7 +181,7 @@ class GitHubAPI:
     def _raw(self, method: str, path: str, payload: dict | None = None) -> dict:
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(f"{API_ROOT}{path}", data=data, method=method)
-        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_unredirected_header("Authorization", f"Bearer {self.token}")
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         req.add_header("User-Agent", USER_AGENT)
@@ -166,16 +193,37 @@ class GitHubAPI:
                 return json.loads(body) if body else {}
         except urllib.error.HTTPError as exc:
             hint = exc.headers.get("retry-after") if exc.headers else None
-            detail = exc.read().decode(errors="replace")[:300]
-            raise GitHubError(exc.code, detail, float(hint) if hint else None) from exc
+            try:
+                retry_after = float(hint) if hint is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
+            try:
+                detail = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                detail = ""
+            raise GitHubError(
+                exc.code,
+                detail,
+                retry_after,
+                method=method,
+                path=path,
+                retryable=is_retryable(exc.code, detail, retry_after),
+            ) from exc
 
     def request(self, method: str, path: str, payload: dict | None = None, attempts: int = 3) -> dict:
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
         delay_gen = backoff_delays()
         for attempt in range(1, attempts + 1):
             try:
                 return self._raw(method, path, payload)
             except GitHubError as exc:
-                if exc.status not in RETRYABLE or attempt == attempts:
+                if not exc.retryable or attempt == attempts:
                     raise
-                self.sleeper(exc.retry_after if exc.retry_after is not None else next(delay_gen))
+                wait = exc.retry_after if exc.retry_after is not None else next(delay_gen)
+                self.sleeper(min(wait, MAX_RETRY_AFTER))
+            except TRANSIENT_ERRORS:
+                if attempt == attempts:
+                    raise
+                self.sleeper(next(delay_gen))
         raise AssertionError("unreachable")

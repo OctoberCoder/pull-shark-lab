@@ -96,3 +96,135 @@ def test_404_is_not_retried(monkeypatch):
     with pytest.raises(GitHubError):
         api.request("GET", "/repos/o/r/contents/missing")
     assert len(calls) == 1
+
+
+def test_401_is_not_retried(monkeypatch):
+    calls = []
+
+    def unauthorized(req, timeout=None):
+        calls.append(1)
+        raise make_http_error(401)
+
+    monkeypatch.setattr("urllib.request.urlopen", unauthorized)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=lambda s: None)
+    with pytest.raises(GitHubError):
+        api.request("GET", "/user")
+    assert len(calls) == 1
+
+
+def test_403_without_rate_limit_signal_is_not_retried(monkeypatch):
+    calls = []
+
+    def forbidden(req, timeout=None):
+        calls.append(1)
+        raise make_http_error(
+            403, body=b'{"message":"Resource not accessible by personal access token"}'
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=lambda s: None)
+    with pytest.raises(GitHubError):
+        api.request("GET", "/user")
+    assert len(calls) == 1
+
+
+def test_403_secondary_rate_limit_is_retried(monkeypatch):
+    responses = [
+        make_http_error(403, body=b'{"message":"You have exceeded a secondary rate limit"}'),
+        FakeResponse(b'{"ok": true}'),
+    ]
+    slept = []
+
+    def fake_urlopen(req, timeout=None):
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=slept.append)
+    assert api.request("GET", "/user") == {"ok": True}
+    assert slept == [60.0]
+
+
+def test_network_error_is_retried(monkeypatch):
+    responses = [urllib.error.URLError("connection reset"), FakeResponse(b'{"ok": true}')]
+    slept = []
+
+    def fake_urlopen(req, timeout=None):
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=slept.append)
+    assert api.request("GET", "/user") == {"ok": True}
+    assert slept == [60.0]
+
+
+def test_malformed_json_body_is_retried(monkeypatch):
+    responses = [FakeResponse(b"<html>proxy error</html>"), FakeResponse(b'{"ok": true}')]
+    slept = []
+
+    def fake_urlopen(req, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=slept.append)
+    assert api.request("GET", "/user") == {"ok": True}
+    assert slept == [60.0]
+
+
+def test_retry_after_is_clamped(monkeypatch):
+    responses = [make_http_error(403, retry_after=3600), FakeResponse(b'{"ok": true}')]
+    slept = []
+
+    def fake_urlopen(req, timeout=None):
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=slept.append)
+    api.request("GET", "/user")
+    assert slept == [300.0]
+
+
+def test_non_numeric_retry_after_is_ignored(monkeypatch):
+    headers = {"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}
+    responses = [
+        urllib.error.HTTPError(
+            url="https://api.github.com/x",
+            code=503,
+            msg="err",
+            hdrs=headers,
+            fp=io.BytesIO(b'{"message":"busy"}'),
+        ),
+        FakeResponse(b'{"ok": true}'),
+    ]
+    slept = []
+
+    def fake_urlopen(req, timeout=None):
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=slept.append)
+    api.request("GET", "/user")
+    assert slept == [60.0]
+
+
+def test_error_message_includes_method_and_path(monkeypatch):
+    def not_found(req, timeout=None):
+        raise make_http_error(404)
+
+    monkeypatch.setattr("urllib.request.urlopen", not_found)
+    api = GitHubAPI(token="t", repo="o/r", sleeper=lambda s: None)
+    with pytest.raises(GitHubError) as exc:
+        api.request("GET", "/repos/o/r/contents/missing")
+    assert "GET" in str(exc.value)
+    assert "/repos/o/r/contents/missing" in str(exc.value)
