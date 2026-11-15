@@ -275,3 +275,90 @@ class GitHubAPI:
 
     def whoami(self) -> str:
         return self.request("GET", "/user")["login"]
+
+
+class Runner:
+    """Drives the PR cycle. One call to run_cycle() is one merged PR."""
+
+    LOG_PATH = "activity.log"
+
+    def __init__(
+        self,
+        api,
+        ledger: Ledger,
+        pacer: Pacer,
+        base_branch: str = "main",
+        pair: tuple[str, str] | None = None,
+        out=print,
+    ) -> None:
+        self.api = api
+        self.ledger = ledger
+        self.pacer = pacer
+        self.base_branch = base_branch
+        self.pair = pair
+        self.out = out
+        self.consecutive_failures = 0
+
+    def commit_message(self, seq: int) -> str:
+        msg = f"chore: ledger entry {seq}"
+        if self.pair:
+            name, email = self.pair
+            msg += f"\n\nCo-authored-by: {name} <{email}>"
+        return msg
+
+    def run_cycle(self, seq: int) -> bool:
+        branch = f"cycle-{seq}"
+        try:
+            sha = self.api.default_branch_sha(self.base_branch)
+            self.api.create_ref(branch, sha)
+
+            existing = self.api.get_contents(self.LOG_PATH, self.base_branch)
+            if existing:
+                current = base64.b64decode(existing["content"]).decode()
+                file_sha = existing["sha"]
+            else:
+                current = ""
+                file_sha = None
+            line = f"{seq}\t{datetime.now(timezone.utc).isoformat(timespec='seconds')}\tledger\n"
+            self.api.put_contents(
+                self.LOG_PATH, branch, current + line, self.commit_message(seq), file_sha
+            )
+
+            pr = self.api.open_pr(branch, self.base_branch, f"chore: ledger entry {seq}", line)
+            try:
+                self.api.merge_pr(pr["number"])
+            except GitHubError as exc:
+                if exc.status != 405:
+                    raise
+                # 405 = GitHub has not finished computing mergeability yet.
+                self.pacer.sleeper(3.0)
+                self.api.merge_pr(pr["number"])
+
+            self.ledger.merged += 1
+            self.ledger.save()
+            self.consecutive_failures = 0
+            self.out(f"  ok   cycle {seq} merged (#{pr['number']})")
+            return True
+        except (
+            GitHubError,
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            json.JSONDecodeError,
+        ) as exc:
+            self.consecutive_failures += 1
+            self.out(f"  fail cycle {seq}: {exc}")
+            return False
+
+    def run(self, max_prs: int, max_consecutive_failures: int = 3) -> int:
+        done = 0
+        while done < max_prs:
+            if self.consecutive_failures >= max_consecutive_failures:
+                self.out(f"stopping: {self.consecutive_failures} consecutive failures")
+                break
+            self.pacer.sleep()
+            seq = self.ledger.next_seq()
+            self.ledger.save()
+            if self.run_cycle(seq):
+                done += 1
+        return done
