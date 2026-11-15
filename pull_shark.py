@@ -362,3 +362,96 @@ class Runner:
             if self.run_cycle(seq):
                 done += 1
         return done
+
+
+def parse_pair(value: str) -> tuple[str, str]:
+    name, _, email = value.rpartition(":")
+    if not name or "@" not in email:
+        raise SystemExit(f"--pair must be NAME:EMAIL, got {value!r}")
+    return name, email
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Open and merge small PRs, paced under rate limits.")
+    p.add_argument("--repo", default="OctoberCoder/pull-shark-lab")
+    p.add_argument("--max", type=int, default=320, help="PRs to merge this run")
+    p.add_argument("--base", default="main")
+    p.add_argument("--state", default=".state/ledger.json")
+    p.add_argument("--interval", type=float, default=30.0)
+    p.add_argument("--cooldown-every", type=int, default=50)
+    p.add_argument("--cooldown-secs", type=float, default=300.0)
+    p.add_argument("--pair", type=parse_pair, default=None, metavar="NAME:EMAIL")
+    p.add_argument("--fast", action="store_true", help="12s interval, no cool-down")
+    p.add_argument("--dry-run", action="store_true", help="check access, write nothing")
+    return p
+
+
+def token_from_gh() -> str:
+    try:
+        out = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, check=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit("gh auth token failed; run `gh auth login` first") from exc
+    token = out.stdout.strip()
+    if not token:
+        raise SystemExit("gh returned an empty token")
+    return token
+
+
+def validate_args(args):
+    if args.interval <= 0:
+        raise SystemExit("--interval must be greater than 0 (0 would spin unpaced)")
+    if args.max <= 0:
+        raise SystemExit("--max must be greater than 0")
+    if args.fast and args.max > 125:
+        print("warning: --fast exceeds ~125 PRs/hour; secondary limits will throttle", file=sys.stderr)
+    return args
+
+
+def parse_args(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.fast:
+        args.interval = 12.0
+        args.cooldown_every = 0
+    return validate_args(args)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    api = GitHubAPI(token=token_from_gh(), repo=args.repo)
+    login = api.whoami()
+    current = api.merged_pr_count(login)
+    print(f"authenticated as {login}")
+    print(f"merged PRs now: {current}  (Pull Shark x4 at 1024)")
+    print(f"this run: up to {args.max} PRs at {args.interval:.0f}s interval")
+    if args.pair:
+        print(f"pair mode: co-author {args.pair[0]} <{args.pair[1]}>")
+
+    if args.dry_run:
+        print("dry run: no writes performed")
+        return 0
+
+    ledger = Ledger.load(Path(args.state))
+    pacer = Pacer(
+        interval=args.interval,
+        cooldown_every=args.cooldown_every,
+        cooldown_secs=args.cooldown_secs,
+    )
+    runner = Runner(api=api, ledger=ledger, pacer=pacer, base_branch=args.base, pair=args.pair)
+    try:
+        done = runner.run(args.max)
+    except KeyboardInterrupt:
+        print(f"\ninterrupted; {ledger.merged} merged this session, state saved")
+        return 130
+    finally:
+        ledger.save()
+
+    after = api.merged_pr_count(login)
+    print(f"done: {done} merged; account total {current} -> {after} (delta {after - current})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
