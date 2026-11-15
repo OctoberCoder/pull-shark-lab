@@ -227,3 +227,51 @@ class GitHubAPI:
                     raise
                 self.sleeper(next(delay_gen))
         raise AssertionError("unreachable")
+
+    def default_branch_sha(self, branch: str) -> str:
+        data = self.request("GET", f"/repos/{self.repo}/git/ref/heads/{branch}")
+        return data["object"]["sha"]
+
+    def create_ref(self, branch: str, sha: str) -> dict:
+        return self.request(
+            "POST", f"/repos/{self.repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha}
+        )
+
+    def get_contents(self, path: str, branch: str) -> dict | None:
+        try:
+            return self.request("GET", f"/repos/{self.repo}/contents/{path}?ref={branch}")
+        except GitHubError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def put_contents(self, path: str, branch: str, text: str, message: str, sha: str | None) -> dict:
+        payload = {
+            "message": message,
+            "content": base64.b64encode(text.encode()).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        return self.request("PUT", f"/repos/{self.repo}/contents/{path}", payload)
+
+    def open_pr(self, head: str, base: str, title: str, body: str = "") -> dict:
+        return self.request(
+            "POST",
+            f"/repos/{self.repo}/pulls",
+            {"title": title, "body": body, "head": head, "base": base},
+        )
+
+    def merge_pr(self, number: int) -> dict:
+        return self.request(
+            "PUT", f"/repos/{self.repo}/pulls/{number}/merge", {"merge_method": "squash"}
+        )
+
+    def merged_pr_count(self, login: str) -> int:
+        data = self.request(
+            "GET", f"/search/issues?q=is:pr+is:merged+author:{login}&per_page=1"
+        )
+        return int(data.get("total_count", 0))
+
+    def whoami(self) -> str:
+        return self.request("GET", "/user")["login"]
