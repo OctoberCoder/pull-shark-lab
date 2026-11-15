@@ -128,3 +128,54 @@ class Pacer:
             self.sleeper(self.cooldown_secs)
             return
         self.sleeper(self.next_delay())
+
+
+class GitHubError(RuntimeError):
+    """An HTTP error from the GitHub API, with status and retry hint preserved."""
+
+    def __init__(self, status: int, message: str, retry_after: float | None = None) -> None:
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+        self.message = message
+        self.retry_after = retry_after
+
+
+RETRYABLE = frozenset({403, 429, 500, 502, 503, 504})
+
+
+class GitHubAPI:
+    """Thin REST wrapper. Every call goes through request() for uniform retry."""
+
+    def __init__(self, token: str, repo: str, sleeper=time.sleep) -> None:
+        self.token = token
+        self.repo = repo
+        self.sleeper = sleeper
+
+    def _raw(self, method: str, path: str, payload: dict | None = None) -> dict:
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(f"{API_ROOT}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", USER_AGENT)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read()
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            hint = exc.headers.get("retry-after") if exc.headers else None
+            detail = exc.read().decode(errors="replace")[:300]
+            raise GitHubError(exc.code, detail, float(hint) if hint else None) from exc
+
+    def request(self, method: str, path: str, payload: dict | None = None, attempts: int = 3) -> dict:
+        delay_gen = backoff_delays()
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._raw(method, path, payload)
+            except GitHubError as exc:
+                if exc.status not in RETRYABLE or attempt == attempts:
+                    raise
+                self.sleeper(exc.retry_after if exc.retry_after is not None else next(delay_gen))
+        raise AssertionError("unreachable")
