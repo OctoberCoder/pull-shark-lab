@@ -86,3 +86,36 @@ class Ledger:
             fh.flush()
             os.fsync(fh.fileno())
         tmp.replace(self.path)
+
+
+class Pacer:
+    """Controls loop timing: jittered interval, periodic cool-down, backoff."""
+
+    def __init__(
+        self,
+        interval: float = 30.0,
+        jitter: float = 0.2,
+        cooldown_every: int = 50,
+        cooldown_secs: float = 300.0,
+        sleeper=time.sleep,
+    ) -> None:
+        self.interval = interval
+        self.jitter = jitter
+        self.cooldown_every = cooldown_every
+        self.cooldown_secs = cooldown_secs
+        self.sleeper = sleeper
+
+    def delay(self) -> float:
+        return self.interval * (1 + random.uniform(-self.jitter, self.jitter))
+
+    def sleep(self, cycles_done: int) -> None:
+        if self.cooldown_every and cycles_done and cycles_done % self.cooldown_every == 0:
+            self.sleeper(self.cooldown_secs)
+            return
+        self.sleeper(self.delay())
+
+    def backoff_delays(self):
+        delay = 60
+        while True:
+            yield delay
+            delay = min(delay * 2, 240)
