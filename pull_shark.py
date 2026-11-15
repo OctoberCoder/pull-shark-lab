@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,8 +89,20 @@ class Ledger:
         tmp.replace(self.path)
 
 
+def backoff_delays() -> Iterator[float]:
+    """Exponential backoff schedule for rate-limited retries, capped at 240s."""
+    delay = 60.0
+    while True:
+        yield delay
+        delay = min(delay * 2, 240.0)
+
+
 class Pacer:
-    """Controls loop timing: jittered interval, periodic cool-down, backoff."""
+    """Controls loop timing: jittered interval and periodic cool-down.
+
+    Tracks its own cycle count so cadence follows elapsed attempts, not
+    successes: a stalled loop must not re-trigger cool-downs.
+    """
 
     def __init__(
         self,
@@ -104,18 +117,14 @@ class Pacer:
         self.cooldown_every = cooldown_every
         self.cooldown_secs = cooldown_secs
         self.sleeper = sleeper
+        self.cycles = 0
 
-    def delay(self) -> float:
-        return self.interval * (1 + random.uniform(-self.jitter, self.jitter))
+    def next_delay(self) -> float:
+        return max(0.0, self.interval * (1 + random.uniform(-self.jitter, self.jitter)))
 
-    def sleep(self, cycles_done: int) -> None:
-        if self.cooldown_every and cycles_done and cycles_done % self.cooldown_every == 0:
+    def sleep(self) -> None:
+        self.cycles += 1
+        if self.cooldown_every and self.cycles % self.cooldown_every == 0:
             self.sleeper(self.cooldown_secs)
             return
-        self.sleeper(self.delay())
-
-    def backoff_delays(self):
-        delay = 60
-        while True:
-            yield delay
-            delay = min(delay * 2, 240)
+        self.sleeper(self.next_delay())
